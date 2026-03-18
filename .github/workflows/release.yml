@@ -6,7 +6,7 @@ on:
       - "*"
 
 permissions: {}
-
+workflow_dispatch: 
 jobs:
   build_release:
     name: Build Release
