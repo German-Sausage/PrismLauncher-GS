@@ -1,4 +1,4 @@
-name: Build
+name: Build And Release
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -68,7 +68,6 @@ jobs:
           - os: windows-2022
             artifact-name: Windows-MSVC
             cmake-preset: windows_msvc
-            # TODO(@getchoo): This is the default in setup-dependencies/windows. Why isn't it working?!?!
             vcvars-arch: amd64
             qt-version: 6.10.2
 
@@ -95,7 +94,6 @@ jobs:
       BUILD_PLATFORM: official
       BUILD_TYPE: ${{ inputs.build-type || 'Debug' }}
       CMAKE_PRESET: ${{ matrix.cmake-preset }}
-
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx-deployment-target }}
 
     steps:
@@ -144,9 +142,7 @@ jobs:
         run: |
           echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      # ── Normal packages ────────────────────────────────────────────────────
-
-      - name: Package Normal (Linux)
+      - name: Package (Linux)
         if: ${{ runner.os == 'Linux' }}
         uses: ./.github/actions/package/linux
         with:
@@ -154,19 +150,17 @@ jobs:
           build-type: ${{ steps.setup-dependencies.outputs.build-type }}
           artifact-name: ${{ matrix.artifact-name }}
           qt-version: ${{ steps.setup-dependencies.outputs.qt-version }}
-          portable: false
 
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-private-key-id: ${{ secrets.GPG_PRIVATE_KEY_ID }}
 
-      - name: Package Normal (macOS)
+      - name: Package (macOS)
         if: ${{ runner.os == 'macOS' }}
         uses: ./.github/actions/package/macos
         with:
           version: ${{ steps.short-version.outputs.version }}
           build-type: ${{ steps.setup-dependencies.outputs.build-type }}
           artifact-name: ${{ matrix.artifact-name }}
-          portable: false
 
           apple-codesign-cert: ${{ secrets.APPLE_CODESIGN_CERT }}
           apple-codesign-password: ${{ secrets.APPLE_CODESIGN_PASSWORD }}
@@ -176,7 +170,7 @@ jobs:
           apple-notarize-password: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
           sparkle-ed25519-key: ${{ secrets.SPARKLE_ED25519_KEY }}
 
-      - name: Package Normal (Windows)
+      - name: Package (Windows)
         if: ${{ runner.os == 'Windows' }}
         uses: ./.github/actions/package/windows
         env:
@@ -186,115 +180,73 @@ jobs:
           build-type: ${{ steps.setup-dependencies.outputs.build-type }}
           artifact-name: ${{ matrix.artifact-name }}
           msystem: ${{ matrix.msystem }}
-          portable: false
 
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── Portable packages ──────────────────────────────────────────────────
+      ##
+      # UPLOAD
+      ##
 
-      - name: Package Portable (Linux)
-        if: ${{ runner.os == 'Linux' }}
-        uses: ./.github/actions/package/linux
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          version: ${{ steps.short-version.outputs.version }}
-          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
-          artifact-name: ${{ matrix.artifact-name }}-Portable
-          qt-version: ${{ steps.setup-dependencies.outputs.qt-version }}
-          portable: true
-
-          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-          gpg-private-key-id: ${{ secrets.GPG_PRIVATE_KEY_ID }}
-
-      - name: Package Portable (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        uses: ./.github/actions/package/macos
-        with:
-          version: ${{ steps.short-version.outputs.version }}
-          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
-          artifact-name: ${{ matrix.artifact-name }}-Portable
-          portable: true
-
-          apple-codesign-cert: ${{ secrets.APPLE_CODESIGN_CERT }}
-          apple-codesign-password: ${{ secrets.APPLE_CODESIGN_PASSWORD }}
-          apple-codesign-id: ${{ secrets.APPLE_CODESIGN_ID }}
-          apple-notarize-apple-id: ${{ secrets.APPLE_NOTARIZE_APPLE_ID }}
-          apple-notarize-team-id: ${{ secrets.APPLE_NOTARIZE_TEAM_ID }}
-          apple-notarize-password: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
-          sparkle-ed25519-key: ${{ secrets.SPARKLE_ED25519_KEY }}
-
-      - name: Package Portable (Windows)
-        if: ${{ runner.os == 'Windows' }}
-        uses: ./.github/actions/package/windows
-        env:
-          CI_HAS_ACCESS_TO_AZURE: ${{ vars.CI_HAS_ACCESS_TO_AZURE || '' }}
-        with:
-          version: ${{ steps.short-version.outputs.version }}
-          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
-          artifact-name: ${{ matrix.artifact-name }}-Portable
-          msystem: ${{ matrix.msystem }}
-          portable: true
-
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          name: ${{ env.ARTIFACT_NAME }}
+          # Adjust this glob to wherever your packaging steps drop their output files
+          path: |
+            packages/**
+          if-no-files-found: warn
+          retention-days: 7
 
   ##
   # RELEASE
   ##
 
   release:
-    name: Publish Releases
-    # Only publish releases on workflow_dispatch or workflow_call (not on PRs/merge queue)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
+    name: Release
+    # Wait for every platform build to succeed before releasing
     needs: build
+    # Only cut a release on pushes to main (or your default branch); skip for PRs and merge-queue checks
+    if: >
+      github.event_name != 'pull_request' &&
+      github.event_name != 'merge_group' &&
+      github.ref == 'refs/heads/main'
+
     runs-on: ubuntu-24.04
 
     permissions:
-      contents: write
+      contents: write  # Required to create/push the release and tag
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Get short version
-        id: short-version
+      - name: Compute release metadata
+        id: meta
+        shell: bash
         run: |
-          echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=release-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "name=Release ${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Download normal artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*-Qt6"
-          path: artifacts/normal
-          merge-multiple: true
+          path: release-artifacts
 
-      - name: Download portable artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-Portable-Qt6"
-          path: artifacts/portable
-          merge-multiple: true
+      - name: List downloaded artifacts
+        run: find release-artifacts -type f | sort
 
-      - name: Publish Normal Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.short-version.outputs.version }}
-          name: "Release v${{ steps.short-version.outputs.version }}"
-          body: |
-            Normal (installer) release for all platforms.
-            For portable (no-install) builds, see the [Portable Release](../../releases/tag/v${{ steps.short-version.outputs.version }}-portable).
-          files: artifacts/normal/**
-          fail_on_unmatched_files: true
-
-      - name: Publish Portable Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.short-version.outputs.version }}-portable
-          name: "Release v${{ steps.short-version.outputs.version }} (Portable)"
-          body: |
-            Portable (no-install, extract-and-run) release for all platforms.
-            For standard installer builds, see the [Normal Release](../../releases/tag/v${{ steps.short-version.outputs.version }}).
-          files: artifacts/portable/**
-          fail_on_unmatched_files: true
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          # Set to true for a pre-release when building Debug; false for Release builds
+          prerelease: ${{ (inputs.build-type || 'Debug') != 'Release' }}
+          generate_release_notes: true
+          files: release-artifacts/**/*
