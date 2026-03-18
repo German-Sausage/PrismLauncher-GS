@@ -208,11 +208,6 @@ jobs:
     # Wait for every platform build to succeed before releasing
     needs: build
     # Only cut a release on pushes to main (or your default branch); skip for PRs and merge-queue checks
-    if: >
-      github.event_name != 'pull_request' &&
-      github.event_name != 'merge_group' &&
-      github.ref == 'refs/heads/main'
-
     runs-on: ubuntu-24.04
 
     permissions:
