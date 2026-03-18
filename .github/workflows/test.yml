@@ -1,0 +1,300 @@
+name: Build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+  workflow_call:
+    inputs:
+      build-type:
+        description: Type of build (Debug or Release)
+        type: string
+        default: Debug
+      environment:
+        description: Deployment environment to run under
+        type: string
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: Type of build (Debug or Release)
+        type: string
+        default: Debug
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact-name }})
+
+    environment: ${{ inputs.environment || '' }}
+
+    permissions:
+      contents: read
+      # Required for Azure Trusted Signing
+      id-token: write
+      # Required for vcpkg binary cache
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact-name: Linux
+            cmake-preset: linux
+            qt-version: 6.10.2
+
+          - os: ubuntu-24.04-arm
+            artifact-name: Linux-aarch64
+            cmake-preset: linux
+            qt-version: 6.10.2
+
+          - os: windows-2022
+            artifact-name: Windows-MinGW-w64
+            cmake-preset: windows_mingw
+            msystem: CLANG64
+            vcvars-arch: amd64_x86
+
+          - os: windows-11-arm
+            artifact-name: Windows-MinGW-arm64
+            cmake-preset: windows_mingw
+            msystem: CLANGARM64
+            vcvars-arch: arm64
+
+          - os: windows-2022
+            artifact-name: Windows-MSVC
+            cmake-preset: windows_msvc
+            # TODO(@getchoo): This is the default in setup-dependencies/windows. Why isn't it working?!?!
+            vcvars-arch: amd64
+            qt-version: 6.10.2
+
+          - os: windows-11-arm
+            artifact-name: Windows-MSVC-arm64
+            cmake-preset: windows_msvc
+            vcvars-arch: arm64
+            qt-version: 6.10.2
+
+          - os: macos-26
+            artifact-name: macOS
+            cmake-preset: macos_universal
+            macosx-deployment-target: 12.0
+            qt-version: 6.9.3
+
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        shell: ${{ matrix.msystem != '' && 'msys2 {0}' || 'bash' }}
+
+    env:
+      ARTIFACT_NAME: ${{ matrix.artifact-name }}-Qt6
+      BUILD_PLATFORM: official
+      BUILD_TYPE: ${{ inputs.build-type || 'Debug' }}
+      CMAKE_PRESET: ${{ matrix.cmake-preset }}
+
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx-deployment-target }}
+
+    steps:
+      ##
+      # SETUP
+      ##
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Setup dependencies
+        id: setup-dependencies
+        uses: ./.github/actions/setup-dependencies
+        with:
+          build-type: ${{ env.BUILD_TYPE }}
+          artifact-name: ${{ matrix.artifact-name }}
+          msystem: ${{ matrix.msystem }}
+          vcvars-arch: ${{ matrix.vcvars-arch }}
+          qt-version: ${{ matrix.qt-version }}
+
+      ##
+      # BUILD
+      ##
+
+      - name: Configure project
+        run: |
+          cmake --preset "$CMAKE_PRESET"
+
+      - name: Run build
+        run: |
+          cmake --build --preset "$CMAKE_PRESET" --config "$BUILD_TYPE"
+
+      - name: Run tests
+        run: |
+          ctest --preset "$CMAKE_PRESET" --build-config "$BUILD_TYPE"
+
+      ##
+      # PACKAGE
+      ##
+
+      - name: Get short version
+        id: short-version
+        shell: bash
+        run: |
+          echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ── Normal packages ────────────────────────────────────────────────────
+
+      - name: Package Normal (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        uses: ./.github/actions/package/linux
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}
+          qt-version: ${{ steps.setup-dependencies.outputs.qt-version }}
+          portable: false
+
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-private-key-id: ${{ secrets.GPG_PRIVATE_KEY_ID }}
+
+      - name: Package Normal (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        uses: ./.github/actions/package/macos
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}
+          portable: false
+
+          apple-codesign-cert: ${{ secrets.APPLE_CODESIGN_CERT }}
+          apple-codesign-password: ${{ secrets.APPLE_CODESIGN_PASSWORD }}
+          apple-codesign-id: ${{ secrets.APPLE_CODESIGN_ID }}
+          apple-notarize-apple-id: ${{ secrets.APPLE_NOTARIZE_APPLE_ID }}
+          apple-notarize-team-id: ${{ secrets.APPLE_NOTARIZE_TEAM_ID }}
+          apple-notarize-password: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          sparkle-ed25519-key: ${{ secrets.SPARKLE_ED25519_KEY }}
+
+      - name: Package Normal (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: ./.github/actions/package/windows
+        env:
+          CI_HAS_ACCESS_TO_AZURE: ${{ vars.CI_HAS_ACCESS_TO_AZURE || '' }}
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}
+          msystem: ${{ matrix.msystem }}
+          portable: false
+
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── Portable packages ──────────────────────────────────────────────────
+
+      - name: Package Portable (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        uses: ./.github/actions/package/linux
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}-Portable
+          qt-version: ${{ steps.setup-dependencies.outputs.qt-version }}
+          portable: true
+
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-private-key-id: ${{ secrets.GPG_PRIVATE_KEY_ID }}
+
+      - name: Package Portable (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        uses: ./.github/actions/package/macos
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}-Portable
+          portable: true
+
+          apple-codesign-cert: ${{ secrets.APPLE_CODESIGN_CERT }}
+          apple-codesign-password: ${{ secrets.APPLE_CODESIGN_PASSWORD }}
+          apple-codesign-id: ${{ secrets.APPLE_CODESIGN_ID }}
+          apple-notarize-apple-id: ${{ secrets.APPLE_NOTARIZE_APPLE_ID }}
+          apple-notarize-team-id: ${{ secrets.APPLE_NOTARIZE_TEAM_ID }}
+          apple-notarize-password: ${{ secrets.APPLE_NOTARIZE_PASSWORD }}
+          sparkle-ed25519-key: ${{ secrets.SPARKLE_ED25519_KEY }}
+
+      - name: Package Portable (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: ./.github/actions/package/windows
+        env:
+          CI_HAS_ACCESS_TO_AZURE: ${{ vars.CI_HAS_ACCESS_TO_AZURE || '' }}
+        with:
+          version: ${{ steps.short-version.outputs.version }}
+          build-type: ${{ steps.setup-dependencies.outputs.build-type }}
+          artifact-name: ${{ matrix.artifact-name }}-Portable
+          msystem: ${{ matrix.msystem }}
+          portable: true
+
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  ##
+  # RELEASE
+  ##
+
+  release:
+    name: Publish Releases
+    # Only publish releases on workflow_dispatch or workflow_call (not on PRs/merge queue)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
+    needs: build
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get short version
+        id: short-version
+        run: |
+          echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download normal artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-Qt6"
+          path: artifacts/normal
+          merge-multiple: true
+
+      - name: Download portable artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-Portable-Qt6"
+          path: artifacts/portable
+          merge-multiple: true
+
+      - name: Publish Normal Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.short-version.outputs.version }}
+          name: "Release v${{ steps.short-version.outputs.version }}"
+          body: |
+            Normal (installer) release for all platforms.
+            For portable (no-install) builds, see the [Portable Release](../../releases/tag/v${{ steps.short-version.outputs.version }}-portable).
+          files: artifacts/normal/**
+          fail_on_unmatched_files: true
+
+      - name: Publish Portable Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.short-version.outputs.version }}-portable
+          name: "Release v${{ steps.short-version.outputs.version }} (Portable)"
+          body: |
+            Portable (no-install, extract-and-run) release for all platforms.
+            For standard installer builds, see the [Normal Release](../../releases/tag/v${{ steps.short-version.outputs.version }}).
+          files: artifacts/portable/**
+          fail_on_unmatched_files: true
